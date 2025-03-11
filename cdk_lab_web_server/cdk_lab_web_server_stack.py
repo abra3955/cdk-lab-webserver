@@ -1,50 +1,60 @@
-import os.path
-
-from aws_cdk.aws_s3_assets import Asset as S3asset
-
 from aws_cdk import (
-    # Duration,
     Stack,
     aws_ec2 as ec2,
-    aws_iam as iam
-    # aws_sqs as sqs,
+    aws_iam as iam,
+    aws_s3_assets as s3_assets,
+    aws_rds as rds
 )
-
 from constructs import Construct
 
-dirname = os.path.dirname(__file__)
-        
 class CdkLabWebServerStack(Stack):
+    def __init__(self, scope: Construct, id: str,vpc : ec2.Vpc, **kwargs):
+        super().__init__(scope, id, **kwargs)
 
-    def __init__(self, scope: Construct, construct_id: str, cdk_lab_vpc: ec2.Vpc, **kwargs) -> None:
-        super().__init__(scope, construct_id, **kwargs)
-
-        # The code that defines your stack goes here
-
-        # Instance Role and SSM Managed Policy
-        InstanceRole = iam.Role(self, "InstanceSSM", assumed_by=iam.ServicePrincipal("ec2.amazonaws.com"))
-
-        InstanceRole.add_managed_policy(iam.ManagedPolicy.from_aws_managed_policy_name("AmazonSSMManagedInstanceCore"))
+        web_sg = ec2.SecurityGroup(self, "WebServerSG", 
+            vpc=vpc, description="Allow HTTP access to web servers", allow_all_outbound=True)
+        web_sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(80), "Allow HTTP from anywhere")
         
-        # Create an EC2 instance
-        cdk_lab_web_instance = ec2.Instance(self, "cdk_lab_web_instance", vpc=cdk_lab_vpc,
-                                            instance_type=ec2.InstanceType("t2.micro"),
-                                            machine_image=ec2.AmazonLinuxImage(generation=ec2.AmazonLinuxGeneration.AMAZON_LINUX_2),
-                                            role=InstanceRole)
+        rds_sg = ec2.SecurityGroup(self, "DatabaseSG",
+            vpc=vpc, description="Allow MySQL access from web servers", allow_all_outbound=True)
+        rds_sg.add_ingress_rule(web_sg, ec2.Port.tcp(3306), "Allow MySQL from web servers")  # web_sg as source&#8203;:contentReference[oaicite:7]{index=7}
 
+        instance_role = iam.Role(self, "WebInstanceRole", 
+            assumed_by=iam.ServicePrincipal("ec2.amazonaws.com"))
 
-        # Script in S3 as Asset
-        webinitscriptasset = S3asset(self, "Asset", path=os.path.join(dirname, "configure.sh"))
-        asset_path = cdk_lab_web_instance.user_data.add_s3_download_command(
-            bucket=webinitscriptasset.bucket,
-            bucket_key=webinitscriptasset.s3_object_key
-        )
+        setup_script_asset = s3_assets.Asset(self, "SetupScriptAsset", path="./cdk_lab_web_server/configure.sh")
+        website_asset = s3_assets.Asset(self, "WebsiteZipAsset", path="./static-website.zip")
 
-        # Userdata executes script from S3
-        cdk_lab_web_instance.user_data.add_execute_file_command(
-            file_path=asset_path
+        setup_script_asset.grant_read(instance_role)
+        website_asset.grant_read(instance_role)
+
+        public_subnets = vpc.select_subnets(subnet_type=ec2.SubnetType.PUBLIC).subnets
+        for idx, subnet in enumerate(public_subnets):
+            instance = ec2.Instance(self, f"WebServer{idx+1}",
+                instance_type=ec2.InstanceType("t2.micro"),
+                machine_image=ec2.MachineImage.latest_amazon_linux(),  # Amazon Linux 2
+                vpc=vpc,
+                vpc_subnets=ec2.SubnetSelection(subnets=[subnet]),
+                role=instance_role,
+                security_group=web_sg
             )
-        webinitscriptasset.grant_read(cdk_lab_web_instance.role)
+            local_path = instance.user_data.add_s3_download_command(
+                bucket=setup_script_asset.bucket, bucket_key=setup_script_asset.s3_object_key
+            )
+            instance.user_data.add_execute_file_command(file_path=local_path) 
+            instance.user_data.add_s3_download_command(
+                bucket=website_asset.bucket, bucket_key=website_asset.s3_object_key, local_file="/tmp/website.zip"
+            )
+            instance.user_data.add_commands("unzip /tmp/website.zip -d /var/www/html/")
         
-        # Allow inbound HTTP traffic in security groups
-        cdk_lab_web_instance.connections.allow_from_any_ipv4(ec2.Port.tcp(80))
+        db_instance = rds.DatabaseInstance(self, "MyDatabase",
+            engine=rds.DatabaseInstanceEngine.mysql(version=rds.MysqlEngineVersion.VER_8_0_32),
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            security_groups=[rds_sg],
+            instance_type=ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE3, ec2.InstanceSize.MICRO),
+            multi_az=False,
+            publicly_accessible=False,
+            credentials=rds.Credentials.from_generated_secret("admin"),  # admin username, auto-generated password
+            database_name="myappdb"
+        )
